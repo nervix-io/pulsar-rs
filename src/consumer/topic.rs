@@ -1,4 +1,6 @@
 use std::{
+    future::Future,
+    io,
     marker::PhantomData,
     pin::Pin,
     sync::{
@@ -12,7 +14,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use futures::{
     channel::{mpsc, oneshot},
-    FutureExt, SinkExt, Stream, StreamExt,
+    future::{select, Either},
+    pin_mut, FutureExt, SinkExt, Stream, StreamExt,
 };
 
 use crate::{
@@ -37,6 +40,11 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     topic: String,
     messages: Pin<Box<MessageIdDataReceiver>>,
     engine_tx: mpsc::UnboundedSender<EngineMessage<Exe>>,
+    /// Times the answers this consumer awaits from its engine.
+    executor: Arc<Exe>,
+    /// How long this consumer waits for the answer to an acknowledgement or a negative
+    /// acknowledgement, the client's operation timeout.
+    operation_timeout: Duration,
     data_type: PhantomData<fn(Payload) -> T::Output>,
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
     pub(super) last_message_received: Option<DateTime<Utc>>,
@@ -138,6 +146,8 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             topic,
             messages: Box::pin(rx),
             engine_tx,
+            executor: client.executor.clone(),
+            operation_timeout: client.operation_retry_options.operation_timeout,
             data_type: PhantomData,
             dead_letter_policy,
             last_message_received: None,
@@ -182,18 +192,24 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
-        self.engine_tx
-            .send(EngineMessage::Ack(msg.message_id().clone(), false))
-            .await?;
-        Ok(())
+        self.acknowledge(vec![msg.message_id().clone()], false)
+            .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn ack_with_id(&mut self, msg_id: MessageIdData) -> Result<(), ConsumerError> {
-        self.engine_tx
-            .send(EngineMessage::Ack(msg_id, false))
-            .await?;
-        Ok(())
+        self.acknowledge(vec![msg_id], false).await
+    }
+
+    /// acknowledges the messages with the given IDs, in one command
+    ///
+    /// with `ConsumerOptions::ack_receipt_enabled`, one answer from the broker confirms them all
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn ack_with_ids(&mut self, msg_ids: Vec<MessageIdData>) -> Result<(), ConsumerError> {
+        if msg_ids.is_empty() {
+            return Ok(());
+        }
+        self.acknowledge(msg_ids, false).await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -203,10 +219,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn cumulative_ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
-        self.engine_tx
-            .send(EngineMessage::Ack(msg.message_id().clone(), true))
-            .await?;
-        Ok(())
+        self.acknowledge(vec![msg.message_id().clone()], true).await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -214,24 +227,90 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         &mut self,
         msg_id: MessageIdData,
     ) -> Result<(), ConsumerError> {
+        self.acknowledge(vec![msg_id], true).await
+    }
+
+    /// Acknowledges `msg_ids`. Without `ConsumerOptions::ack_receipt_enabled` this returns once
+    /// the engine queued an acknowledgement for each of them; with it, once the broker answered
+    /// the one command that carries them all, within the client's operation timeout.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn acknowledge(
+        &mut self,
+        msg_ids: Vec<MessageIdData>,
+        cumulative: bool,
+    ) -> Result<(), ConsumerError> {
+        if !self.config.options.ack_receipt_enabled {
+            for msg_id in msg_ids {
+                self.engine_tx
+                    .send(EngineMessage::Ack(msg_id, cumulative))
+                    .await?;
+            }
+            return Ok(());
+        }
+        let (receipt_tx, receipt) = oneshot::channel();
         self.engine_tx
-            .send(EngineMessage::Ack(msg_id, true))
+            .send(EngineMessage::AckWithReceipt(
+                msg_ids, cumulative, receipt_tx,
+            ))
             .await?;
-        Ok(())
+        self.await_engine_answer(async move {
+            let answer = receipt
+                .await
+                .map_err(|oneshot::Canceled| ConnectionError::Disconnected)??;
+            answer.await
+        })
+        .await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn nack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
-        self.engine_tx
-            .send(EngineMessage::Nack(msg.message_id().clone()))
-            .await?;
-        Ok(())
+        self.negatively_acknowledge(msg.message_id().clone()).await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn nack_with_id(&mut self, msg_id: MessageIdData) -> Result<(), ConsumerError> {
-        self.engine_tx.send(EngineMessage::Nack(msg_id)).await?;
-        Ok(())
+        self.negatively_acknowledge(msg_id).await
+    }
+
+    /// Asks the broker to redeliver `msg_id`, and returns once the engine sent the redelivery
+    /// request, within the client's operation timeout, or with the error that kept it from
+    /// sending it. The broker does not answer a redelivery request.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn negatively_acknowledge(&mut self, msg_id: MessageIdData) -> Result<(), ConsumerError> {
+        let (outcome_tx, outcome) = oneshot::channel();
+        self.engine_tx
+            .send(EngineMessage::Nack(msg_id, outcome_tx))
+            .await?;
+        self.await_engine_answer(async move {
+            outcome
+                .await
+                .map_err(|oneshot::Canceled| ConnectionError::Disconnected)?
+        })
+        .await
+    }
+
+    /// Waits for an answer the engine gives, within the client's operation timeout. The engine
+    /// takes its messages in order, so a reconnection it performs first holds the answer back.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn await_engine_answer(
+        &self,
+        answer: impl Future<Output = Result<(), ConnectionError>>,
+    ) -> Result<(), ConsumerError> {
+        let deadline = self.executor.delay(self.operation_timeout);
+        pin_mut!(answer);
+        pin_mut!(deadline);
+        match select(answer, deadline).await {
+            Either::Left((answered, _)) => answered.map_err(ConsumerError::Connection),
+            Either::Right(_) => Err(ConsumerError::Connection(ConnectionError::Io(
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "consumer {} got no answer from its engine within {:?}",
+                        self.consumer_id, self.operation_timeout
+                    ),
+                ),
+            ))),
+        }
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]

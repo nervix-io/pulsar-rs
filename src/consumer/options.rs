@@ -33,6 +33,16 @@ pub struct ConsumerOptions {
     /// }
     /// ```
     pub initial_position: InitialPosition,
+    /// Whether an acknowledgement returns only once the broker answered it.
+    ///
+    /// When enabled, every acknowledgement carries a request id, and `ack`, `ack_with_id`,
+    /// `cumulative_ack` and `cumulative_ack_with_id` return once the broker's
+    /// `CommandAckResponse` arrived, with the server error it carries if the broker refused the
+    /// acknowledgement. An acknowledgement the broker does not answer within the client's
+    /// operation timeout, or whose connection closes first, fails instead. When disabled, the
+    /// default, they return once the acknowledgement is queued for the connection, as the Java
+    /// client does without `ackReceiptEnabled`.
+    pub ack_receipt_enabled: bool,
 }
 
 impl ConsumerOptions {
@@ -83,6 +93,13 @@ impl ConsumerOptions {
     pub fn with_receiver_queue_size(mut self, size: u32) -> Self {
         // todo: support zero_queue_size consumer
         self.receiver_queue_size = Some(if size == 0 { 1000 } else { size });
+        self
+    }
+
+    /// within options, sets whether an acknowledgement waits for the broker's answer
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_ack_receipt_enabled(mut self, enabled: bool) -> Self {
+        self.ack_receipt_enabled = enabled;
         self
     }
 }

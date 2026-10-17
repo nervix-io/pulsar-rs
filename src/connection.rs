@@ -607,9 +607,43 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         cumulative: bool,
     ) -> Result<(), ConnectionError> {
         self.control_tx
-            .send(messages::ack(consumer_id, message_ids, cumulative))
+            .send(messages::ack(consumer_id, message_ids, cumulative, None))
             .await?;
         Ok(())
+    }
+
+    /// Sends an acknowledgement that carries a request id, and returns the receipt that resolves
+    /// once the broker answered it: with `ConnectionError::PulsarError` when the broker refused
+    /// it, and with an error when the broker does not answer within the operation timeout or the
+    /// connection closes first. The acknowledgement is sent before this returns, so the caller can
+    /// await its receipt without holding up whatever sends the next one.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn send_ack_with_receipt(
+        &self,
+        consumer_id: u64,
+        message_ids: Vec<proto::MessageIdData>,
+        cumulative: bool,
+    ) -> Result<impl Future<Output = Result<(), ConnectionError>> + Send, ConnectionError> {
+        let request_id = self.request_id.get();
+        let msg = messages::ack(consumer_id, message_ids, cumulative, Some(request_id));
+        let answer = self
+            .send_message_non_blocking(
+                msg,
+                RequestKey::RequestId(request_id),
+                |resp| resp.command.ack_response,
+                SendChannel::Control,
+            )
+            .await?;
+        Ok(async move {
+            let response = answer.await?;
+            match response.error {
+                Some(error) => Err(ConnectionError::PulsarError(
+                    crate::error::server_error(error),
+                    response.message,
+                )),
+                None => Ok(()),
+            }
+        })
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -1801,6 +1835,7 @@ pub(crate) mod messages {
         consumer_id: u64,
         message_id: Vec<proto::MessageIdData>,
         cumulative: bool,
+        request_id: Option<u64>,
     ) -> Message {
         Message {
             command: proto::BaseCommand {
@@ -1815,6 +1850,7 @@ pub(crate) mod messages {
                     message_id,
                     validation_error: None,
                     properties: Vec::new(),
+                    request_id,
                     ..Default::default()
                 }),
                 ..Default::default()

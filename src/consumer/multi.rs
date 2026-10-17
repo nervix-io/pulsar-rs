@@ -229,6 +229,19 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn ack_with_ids(
+        &mut self,
+        topic: &str,
+        msg_ids: Vec<MessageIdData>,
+    ) -> Result<(), ConsumerError> {
+        if let Some(c) = self.consumers.get_mut(topic) {
+            c.ack_with_ids(msg_ids).await
+        } else {
+            Err(ConnectionError::Unexpected(format!("no consumer for topic {topic}")).into())
+        }
+    }
+
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn cumulative_ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {
         if let Some(c) = self.consumers.get_mut(&msg.topic) {
             c.cumulative_ack(msg).await

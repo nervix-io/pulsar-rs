@@ -116,6 +116,16 @@ impl Message {
                 get_schema_response: Some(CommandGetSchemaResponse { request_id, .. }),
                 ..
             } => Some(RequestKey::RequestId(*request_id)),
+            // The broker answers an acknowledgement only when it carried a request id, and the
+            // answer resolves the receipt registered under that id.
+            BaseCommand {
+                ack_response:
+                    Some(CommandAckResponse {
+                        request_id: Some(request_id),
+                        ..
+                    }),
+                ..
+            } => Some(RequestKey::RequestId(*request_id)),
             BaseCommand {
                 send:
                     Some(CommandSend {

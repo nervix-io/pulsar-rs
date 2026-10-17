@@ -130,6 +130,21 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
         }
     }
 
+    /// acknowledges the messages of one topic with the given IDs, in one command
+    ///
+    /// with [`ConsumerOptions::ack_receipt_enabled`], one answer from the broker confirms them all
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn ack_with_ids(
+        &mut self,
+        topic: &str,
+        msg_ids: Vec<MessageIdData>,
+    ) -> Result<(), ConsumerError> {
+        match &mut self.inner {
+            InnerConsumer::Single(c) => c.ack_with_ids(msg_ids).await,
+            InnerConsumer::Multi(c) => c.ack_with_ids(topic, msg_ids).await,
+        }
+    }
+
     /// acknowledges a message and all the preceding messages
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn cumulative_ack(&mut self, msg: &Message<T>) -> Result<(), ConsumerError> {

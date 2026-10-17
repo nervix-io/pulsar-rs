@@ -1,14 +1,19 @@
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use futures::channel::{mpsc, oneshot};
 
 use crate::{
     connection::Connection,
+    error::ConnectionError,
     message::{proto::MessageIdData, Message as RawMessage},
     Error, Executor, Payload,
 };
 
 pub type MessageIdDataReceiver = mpsc::Receiver<Result<(MessageIdData, Payload), Error>>;
+
+/// Resolves once the broker answered one acknowledgement, with the server error the answer
+/// carries if the broker refused it. It is bounded by the connection's operation timeout.
+pub type AckReceipt = Pin<Box<dyn Future<Output = Result<(), ConnectionError>> + Send>>;
 
 pub enum EngineEvent<Exe: Executor> {
     Message(Option<RawMessage>),
@@ -16,8 +21,20 @@ pub enum EngineEvent<Exe: Executor> {
 }
 
 pub enum EngineMessage<Exe: Executor> {
+    /// An acknowledgement that returns once it is queued for the connection.
     Ack(MessageIdData, bool),
-    Nack(MessageIdData),
+    /// An acknowledgement of one or more messages whose answer the caller awaits. The engine sends
+    /// them in one command with a request id and hands back the receipt that resolves with the
+    /// broker's answer, or the error that kept it from being sent, so the engine never waits for
+    /// the broker itself.
+    AckWithReceipt(
+        Vec<MessageIdData>,
+        bool,
+        oneshot::Sender<Result<AckReceipt, ConnectionError>>,
+    ),
+    /// A negative acknowledgement, answered with whether its redelivery request was sent. The
+    /// broker does not answer a redelivery request, so a sent one is all the client can confirm.
+    Nack(MessageIdData, oneshot::Sender<Result<(), ConnectionError>>),
     UnackedRedelivery,
     GetConnection(oneshot::Sender<Arc<Connection<Exe>>>),
 }

@@ -14,7 +14,7 @@ use crate::{
     connection::Connection,
     consumer::{
         batched_message_iterator::BatchedMessageIterator,
-        data::{DeadLetterPolicy, EngineEvent, EngineMessage},
+        data::{AckReceipt, DeadLetterPolicy, EngineEvent, EngineMessage},
         options::ConsumerOptions,
     },
     error::{ConnectionError, ConsumerError},
@@ -286,17 +286,30 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                 self.ack(message_id, cumulative).await;
                 true
             }
-            Some(EngineMessage::Nack(message_id)) => {
-                if let Err(e) = self
+            Some(EngineMessage::AckWithReceipt(message_ids, cumulative, receipt)) => {
+                // FIXME: this does not handle cumulative acks
+                for message_id in &message_ids {
+                    self.unacked_messages.remove(message_id);
+                }
+                let sent = self
                     .connection
                     .sender()
-                    .send_redeliver_unacknowleged_messages(self.id, vec![message_id.clone()])
+                    .send_ack_with_receipt(self.id, message_ids, cumulative)
                     .await
-                {
-                    error!(
-                        "could not ask for redelivery for message {:?}: {:?}",
-                        message_id, e
-                    );
+                    .map(|answer| Box::pin(answer) as AckReceipt);
+                if receipt.send(sent).is_err() {
+                    trace!("the acknowledgement's caller stopped waiting for its receipt");
+                }
+                true
+            }
+            Some(EngineMessage::Nack(message_id, outcome)) => {
+                let sent = self
+                    .connection
+                    .sender()
+                    .send_redeliver_unacknowleged_messages(self.id, vec![message_id])
+                    .await;
+                if outcome.send(sent).is_err() {
+                    trace!("the negative acknowledgement's caller stopped waiting for its outcome");
                 }
                 true
             }
