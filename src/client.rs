@@ -588,6 +588,34 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
         Ok(self.with_certificate_chain(v))
     }
 
+    /// use a complete rustls client configuration for every TLS connection
+    ///
+    /// It alone decides the trust anchors, how a server's certificate is verified and the client
+    /// certificate presented, so a client that authenticates with a certificate configures it
+    /// here. `with_certificate_chain` is not read while one is set.
+    #[cfg(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+    ))]
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_rustls_client_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        match &mut self.tls_options {
+            Some(tls) => tls.rustls_client_config = Some(config),
+            None => {
+                self.tls_options = Some(TlsOptions {
+                    rustls_client_config: Some(config),
+                    ..Default::default()
+                })
+            }
+        }
+        self
+    }
+
     /// The internal pending queue size for each producer on a topic partition. (default: 100)
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_outbound_channel_size(mut self, size: usize) -> Self {

@@ -128,6 +128,30 @@ mod tests {
     }
 }
 
+/// The TLS client configuration a connection takes from its client instead of building one, which
+/// only a rustls build can carry.
+#[cfg(all(
+    any(
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ),
+    not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+))]
+pub(crate) type CustomTlsConfig = Option<Arc<rustls::ClientConfig>>;
+/// A native-tls build has no TLS client configuration to take from its client.
+#[cfg(not(all(
+    any(
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ),
+    not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+)))]
+pub(crate) type CustomTlsConfig = ();
+
 /// configuration for TLS connections
 #[derive(Debug, Clone)]
 pub struct TlsOptions {
@@ -136,13 +160,61 @@ pub struct TlsOptions {
 
     /// allow insecure TLS connection if set to true
     ///
+    /// A rustls connection honors this only through `rustls_client_config`.
+    ///
     /// defaults to *false*
     pub allow_insecure_connection: bool,
 
     /// whether hostname verification is enabled when insecure TLS connection is allowed
     ///
+    /// A rustls connection honors this only through `rustls_client_config`.
+    ///
     /// defaults to *true*
     pub tls_hostname_verification_enabled: bool,
+
+    /// a complete rustls client configuration
+    ///
+    /// When set, every TLS connection uses it as given, so it alone decides the trust anchors,
+    /// how a server's certificate is verified and the client certificate presented, and
+    /// `certificate_chain` is not read.
+    ///
+    /// defaults to *None*
+    #[cfg(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+    ))]
+    pub rustls_client_config: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl TlsOptions {
+    #[cfg(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+    ))]
+    fn custom_config(&self) -> CustomTlsConfig {
+        self.rustls_client_config.clone()
+    }
+
+    #[cfg(not(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+    )))]
+    fn custom_config(&self) -> CustomTlsConfig {}
 }
 
 impl Default for TlsOptions {
@@ -152,6 +224,16 @@ impl Default for TlsOptions {
             certificate_chain: None,
             allow_insecure_connection: false,
             tls_hostname_verification_enabled: true,
+            #[cfg(all(
+                any(
+                    feature = "tokio-rustls-runtime-aws-lc-rs",
+                    feature = "tokio-rustls-runtime-ring",
+                    feature = "async-std-rustls-runtime-aws-lc-rs",
+                    feature = "async-std-rustls-runtime-ring"
+                ),
+                not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+            ))]
+            rustls_client_config: None,
         }
     }
 }
@@ -383,6 +465,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 &self.certificate_chain,
                 self.tls_options.allow_insecure_connection,
                 self.tls_options.tls_hostname_verification_enabled,
+                self.tls_options.custom_config(),
                 self.connection_retry_options.connection_timeout,
                 self.operation_retry_options.operation_timeout,
                 self.outbound_channel_size,

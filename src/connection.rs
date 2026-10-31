@@ -26,6 +26,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    connection_manager::CustomTlsConfig,
     consumer::ConsumerOptions,
     error::{AuthenticationError, ConnectionError, SharedError},
     executor::{Executor, ExecutorKind},
@@ -751,7 +752,13 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         F: FnOnce(Message) -> Option<R> + 'static,
     {
         let (resolver, response) = oneshot::channel();
-        trace!("sending message(key = {:?}): {:?}", key, msg);
+        // An authentication response carries the client's credentials, so its content is never
+        // logged.
+        if matches!(key, RequestKey::AuthChallenge) {
+            trace!("sending message(key = {:?})", key);
+        } else {
+            trace!("sending message(key = {:?}): {:?}", key, msg);
+        }
 
         let k = key.clone();
         let error = self.error.clone();
@@ -924,6 +931,7 @@ impl<Exe: Executor> Connection<Exe> {
         certificate_chain: &[Certificate],
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
+        custom_tls_config: CustomTlsConfig,
         connection_timeout: Duration,
         operation_timeout: Duration,
         outbound_channel_size: usize,
@@ -983,6 +991,7 @@ impl<Exe: Executor> Connection<Exe> {
                 certificate_chain,
                 allow_insecure_connection,
                 tls_hostname_verification_enabled,
+                custom_tls_config.clone(),
                 executor.clone(),
                 operation_timeout,
                 outbound_channel_size,
@@ -1022,9 +1031,13 @@ impl<Exe: Executor> Connection<Exe> {
 
         if retryable_errors.is_empty() {
             error!("connection error, not retryable: {:?}", fatal_errors);
-            Err(ConnectionError::Io(std::io::Error::other(
-                "fatal error when connecting to the Pulsar server",
-            )))
+            // The caller decides what a refusal means, such as a broker that refused the client's
+            // credentials, so it gets the error itself rather than a description of it.
+            Err(fatal_errors.into_iter().next().unwrap_or_else(|| {
+                ConnectionError::Io(std::io::Error::other(
+                    "no address to connect to the Pulsar server",
+                ))
+            }))
         } else {
             warn!("retry establish connection on: {:?}", retryable_errors);
             Err(retryable_errors.into_iter().next().unwrap())
@@ -1048,6 +1061,37 @@ impl<Exe: Executor> Connection<Exe> {
         }
     }
 
+    /// The configuration a rustls connection uses: the complete one its client was given, or one
+    /// that trusts the bundled roots and `certificate_chain` and presents no client certificate.
+    #[cfg(all(
+        any(
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ),
+        not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+    ))]
+    fn rustls_config(
+        custom: CustomTlsConfig,
+        certificate_chain: &[Certificate],
+    ) -> Result<Arc<rustls::ClientConfig>, ConnectionError> {
+        if let Some(config) = custom {
+            return Ok(config);
+        }
+        let mut root_store = rustls::RootCertStore::empty();
+
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for certificate in certificate_chain {
+            root_store.add(certificate.clone())?;
+        }
+
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     #[allow(unused_variables)] // allow_insecure_connection and tls_hostname_verification_enabled are native-tls only
     async fn prepare_stream(
@@ -1060,6 +1104,7 @@ impl<Exe: Executor> Connection<Exe> {
         certificate_chain: &[Certificate],
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
+        custom_tls_config: CustomTlsConfig,
         executor: Arc<Exe>,
         operation_timeout: Duration,
         outbound_channel_size: usize,
@@ -1122,18 +1167,9 @@ impl<Exe: Executor> Connection<Exe> {
             ExecutorKind::Tokio => {
                 if tls {
                     let stream = tokio::net::TcpStream::connect(&address).await?;
-                    let mut root_store = rustls::RootCertStore::empty();
+                    let config = Self::rustls_config(custom_tls_config, certificate_chain)?;
 
-                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                    for certificate in certificate_chain {
-                        root_store.add(certificate.clone())?;
-                    }
-
-                    let config = rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
-
-                    let cx = tokio_rustls::TlsConnector::from(Arc::new(config));
+                    let cx = tokio_rustls::TlsConnector::from(config);
                     let stream = cx
                         .connect(
                             rustls::pki_types::ServerName::try_from(hostname.as_str())?.to_owned(),
@@ -1232,18 +1268,9 @@ impl<Exe: Executor> Connection<Exe> {
             ExecutorKind::AsyncStd => {
                 if tls {
                     let stream = async_std::net::TcpStream::connect(&address).await?;
-                    let mut root_store = rustls::RootCertStore::empty();
+                    let config = Self::rustls_config(custom_tls_config, certificate_chain)?;
 
-                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                    for certificate in certificate_chain {
-                        root_store.add(certificate.clone())?;
-                    }
-
-                    let config = rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
-
-                    let connector = futures_rustls::TlsConnector::from(Arc::new(config));
+                    let connector = futures_rustls::TlsConnector::from(config);
                     let stream = connector
                         .connect(
                             rustls::pki_types::ServerName::try_from(hostname.as_str())?.to_owned(),
@@ -1308,9 +1335,9 @@ impl<Exe: Executor> Connection<Exe> {
         let auth_data = Self::prepare_auth_data(auth.clone()).await?;
         stream
             .send({
-                let msg = messages::connect(auth_data, proxy_to_broker_url);
-                trace!("connection message: {:?}", msg);
-                msg
+                // This message carries the client's credentials, so its content is never logged.
+                trace!("sending the connection message");
+                messages::connect(auth_data, proxy_to_broker_url)
             })
             .await?;
 
@@ -1979,7 +2006,7 @@ mod tests {
         producer::ProducerMessage,
         proto::{
             base_command::Type as CommandType, AuthData, CommandAuthChallenge, CommandAuthResponse,
-            CommandConnected, CommandSendError, ServerError,
+            CommandConnected, CommandError, CommandSendError, ServerError,
         },
     };
 
@@ -2065,6 +2092,66 @@ mod tests {
             pong.command
         );
         assert!(!error.is_set(), "receiver should not set error on ping");
+    }
+
+    /// What refused a connection reaches the caller as it was answered: a broker that refuses the
+    /// client's credentials is not an unexplained failure to connect, and never retried.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn connection_refused_by_the_broker_keeps_its_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let broker = tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut stream = tokio_util::codec::Framed::new(stream, Codec);
+            let connect = stream.next().await.unwrap().unwrap();
+            assert!(connect.command.connect.is_some());
+            stream
+                .send(Message {
+                    command: BaseCommand {
+                        r#type: CommandType::Error as i32,
+                        error: Some(CommandError {
+                            request_id: u64::MAX,
+                            error: ServerError::AuthenticationError as i32,
+                            message: "Failed to authenticate".to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                    payload: None,
+                })
+                .await
+                .unwrap();
+        });
+
+        let refusal = Connection::new(
+            url::Url::parse(&format!("pulsar://{address}")).unwrap(),
+            None,
+            None,
+            &[],
+            false,
+            true,
+            Default::default(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            1,
+            Arc::new(TokioExecutor),
+        )
+        .await
+        .err()
+        .expect("the broker refused the connection");
+
+        broker.await.unwrap();
+        assert!(!refusal.establish_retryable());
+        match refusal {
+            ConnectionError::PulsarError(Some(ServerError::AuthenticationError), Some(reason)) => {
+                assert_eq!(reason, "Failed to authenticate");
+            }
+            other => panic!("expected the broker's refusal, got {other:?}"),
+        }
     }
 
     struct TestAuthentication {
