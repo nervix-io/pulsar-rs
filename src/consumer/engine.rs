@@ -14,7 +14,7 @@ use crate::{
     connection::Connection,
     consumer::{
         batched_message_iterator::BatchedMessageIterator,
-        data::{AckReceipt, DeadLetterPolicy, EngineEvent, EngineMessage},
+        data::{AckReceipt, DeadLetterPolicy, EngineEvent, EngineMessage, MessageData},
         options::ConsumerOptions,
     },
     error::{ConnectionError, ConsumerError},
@@ -40,7 +40,7 @@ pub struct ConsumerEngine<Exe: Executor> {
     sub_type: SubType,
     id: u64,
     name: Option<String>,
-    tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+    tx: mpsc::Sender<Result<(MessageData, Payload), Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
@@ -63,7 +63,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         sub_type: SubType,
         id: u64,
         name: Option<String>,
-        tx: mpsc::Sender<Result<(MessageIdData, Payload), Error>>,
+        tx: mpsc::Sender<Result<(MessageData, Payload), Error>>,
         messages_rx: mpsc::UnboundedReceiver<RawMessage>,
         engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
         batch_size: u32,
@@ -608,7 +608,10 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
 
                     self.ack(message_id, false).await;
                 }
-                _ => self.send_to_consumer(message_id, payload).await?,
+                _ => {
+                    self.send_to_consumer(message_id, payload, message.redelivery_count)
+                        .await?
+                }
             }
         }
         Ok(())
@@ -619,10 +622,16 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         &mut self,
         message_id: MessageIdData,
         payload: Payload,
+        redelivery_count: Option<u32>,
     ) -> Result<(), Error> {
         let now = Instant::now();
+        let message_data = MessageData {
+            id: message_id.clone(),
+            batch_size: payload.metadata.num_messages_in_batch,
+            redelivery_count,
+        };
         self.tx
-            .send(Ok((message_id.clone(), payload)))
+            .send(Ok((message_data, payload)))
             .await
             .map_err(|e| {
                 error!("tx returned {:?}", e);

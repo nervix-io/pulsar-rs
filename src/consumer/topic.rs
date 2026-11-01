@@ -374,11 +374,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn create_message(&self, message_id: MessageIdData, payload: Payload) -> Message<T> {
-        let message_id = MessageData {
-            id: message_id,
-            batch_size: payload.metadata.num_messages_in_batch,
-        };
+    fn create_message(&self, message_id: MessageData, payload: Payload) -> Message<T> {
         Message::new(&self.topic, message_id, payload)
     }
 

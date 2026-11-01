@@ -9,7 +9,7 @@ use crate::{
     Error, Executor, Payload,
 };
 
-pub type MessageIdDataReceiver = mpsc::Receiver<Result<(MessageIdData, Payload), Error>>;
+pub type MessageIdDataReceiver = mpsc::Receiver<Result<(MessageData, Payload), Error>>;
 
 /// Resolves once the broker answered one acknowledgement, with the server error the answer
 /// carries if the broker refused it. It is bounded by the connection's operation timeout.
@@ -43,6 +43,8 @@ pub enum EngineMessage<Exe: Executor> {
 pub struct MessageData {
     pub id: MessageIdData,
     pub batch_size: Option<i32>,
+    /// How many times the broker has redelivered this message, when it supplies the count.
+    pub redelivery_count: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

@@ -44,6 +44,14 @@ impl<T> Message<T> {
         &self.message_id.id
     }
 
+    /// The broker's redelivery count, absent when its command carries none.
+    ///
+    /// Every message of a broker batch keeps the count of that delivery. A present zero denotes
+    /// the first delivery and stays distinct from an omitted count.
+    pub fn redelivery_count(&self) -> Option<u32> {
+        self.message_id.redelivery_count
+    }
+
     /// Get message key (partition key string as stored in metadata)
     ///
     /// When [`has_base64_encoded_key`](Self::has_base64_encoded_key) is true, this is the
@@ -106,6 +114,7 @@ mod tests {
                     ..Default::default()
                 },
                 batch_size: None,
+                redelivery_count: None,
             },
             Payload {
                 metadata: MessageMetadata {
@@ -119,6 +128,15 @@ mod tests {
                 data: vec![],
             },
         )
+    }
+
+    #[test]
+    fn redelivery_metadata_preserves_missing_first_and_later_deliveries() {
+        for count in [None, Some(0), Some(1), Some(u32::MAX)] {
+            let mut message = message_with_key(None, None);
+            message.message_id.redelivery_count = count;
+            assert_eq!(message.redelivery_count(), count);
+        }
     }
 
     #[test]
