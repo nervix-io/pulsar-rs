@@ -14,7 +14,7 @@ use crate::{
     connection::Connection,
     consumer::{
         batched_message_iterator::BatchedMessageIterator,
-        data::{AckReceipt, DeadLetterPolicy, EngineEvent, EngineMessage, MessageData},
+        data::{AckReceipt, DeadLetterPolicy, EngineEvent, EngineMessage, ReceivedMessage},
         options::ConsumerOptions,
     },
     error::{ConnectionError, ConsumerError},
@@ -40,7 +40,7 @@ pub struct ConsumerEngine<Exe: Executor> {
     sub_type: SubType,
     id: u64,
     name: Option<String>,
-    tx: mpsc::Sender<Result<(MessageData, Payload), Error>>,
+    tx: mpsc::Sender<Result<ReceivedMessage, Error>>,
     messages_rx: Option<mpsc::UnboundedReceiver<RawMessage>>,
     engine_rx: Option<mpsc::UnboundedReceiver<EngineMessage<Exe>>>,
     event_rx: mpsc::UnboundedReceiver<EngineEvent<Exe>>,
@@ -63,7 +63,7 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         sub_type: SubType,
         id: u64,
         name: Option<String>,
-        tx: mpsc::Sender<Result<(MessageData, Payload), Error>>,
+        tx: mpsc::Sender<Result<ReceivedMessage, Error>>,
         messages_rx: mpsc::UnboundedReceiver<RawMessage>,
         engine_rx: mpsc::UnboundedReceiver<EngineMessage<Exe>>,
         batch_size: u32,
@@ -625,18 +625,15 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         redelivery_count: Option<u32>,
     ) -> Result<(), Error> {
         let now = Instant::now();
-        let message_data = MessageData {
-            id: message_id.clone(),
-            batch_size: payload.metadata.num_messages_in_batch,
+        let received = ReceivedMessage {
+            message_id: message_id.clone(),
+            payload,
             redelivery_count,
         };
-        self.tx
-            .send(Ok((message_data, payload)))
-            .await
-            .map_err(|e| {
-                error!("tx returned {:?}", e);
-                Error::Custom("tx closed".to_string())
-            })?;
+        self.tx.send(Ok(received)).await.map_err(|e| {
+            error!("tx returned {:?}", e);
+            Error::Custom("tx closed".to_string())
+        })?;
         if let Some(duration) = self.unacked_message_redelivery_delay {
             self.unacked_messages.insert(message_id, now + duration);
         }
