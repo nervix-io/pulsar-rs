@@ -22,7 +22,9 @@ use crate::{
     connection::Connection,
     consumer::{
         config::ConsumerConfig,
-        data::{DeadLetterPolicy, EngineMessage, MessageData, MessageIdDataReceiver},
+        data::{
+            DeadLetterPolicy, EngineMessage, MessageData, MessageIdDataReceiver, ReceivedMessage,
+        },
         engine::ConsumerEngine,
         message::Message,
     },
@@ -374,12 +376,17 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    fn create_message(&self, message_id: MessageIdData, payload: Payload) -> Message<T> {
+    fn create_message(&self, received: ReceivedMessage) -> Message<T> {
+        let ReceivedMessage {
+            message_id,
+            payload,
+            redelivery_count,
+        } = received;
         let message_id = MessageData {
             id: message_id,
             batch_size: payload.metadata.num_messages_in_batch,
         };
-        Message::new(&self.topic, message_id, payload)
+        Message::new(&self.topic, message_id, payload, redelivery_count)
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -401,10 +408,10 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
         match self.messages.as_mut().poll_next(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Ok((id, payload)))) => {
+            Poll::Ready(Some(Ok(received))) => {
                 self.last_message_received = Some(Utc::now());
                 self.messages_received += 1;
-                Poll::Ready(Some(Ok(self.create_message(id, payload))))
+                Poll::Ready(Some(Ok(self.create_message(received))))
             }
             Poll::Ready(Some(Err(e))) => {
                 error!("we are using in the single-consumer and we got an error, {e}");

@@ -19,14 +19,22 @@ pub struct Message<T> {
     pub payload: Payload,
     /// contains the message's id and batch size data
     pub message_id: MessageData,
+    /// The redelivery count supplied by this delivery's broker command.
+    pub redelivery_count: Option<u32>,
     pub(super) _phantom: PhantomData<T>,
 }
 
 impl<T> Message<T> {
-    pub fn new(topic: &str, message_id: MessageData, payload: Payload) -> Self {
+    pub fn new(
+        topic: &str,
+        message_id: MessageData,
+        payload: Payload,
+        redelivery_count: Option<u32>,
+    ) -> Self {
         Message {
             topic: topic.to_string(),
             message_id,
+            redelivery_count,
             payload,
             _phantom: PhantomData,
         }
@@ -42,6 +50,14 @@ impl<T> Message<T> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn message_id(&self) -> &MessageIdData {
         &self.message_id.id
+    }
+
+    /// The broker's redelivery count, absent when its command carries none.
+    ///
+    /// Every message of a broker batch keeps the count of that delivery. A present zero denotes
+    /// the first delivery and stays distinct from an omitted count.
+    pub fn redelivery_count(&self) -> Option<u32> {
+        self.redelivery_count
     }
 
     /// Get message key (partition key string as stored in metadata)
@@ -118,7 +134,18 @@ mod tests {
                 },
                 data: vec![],
             },
+            None,
         )
+    }
+
+    #[test]
+    fn redelivery_metadata_preserves_missing_first_and_later_deliveries() {
+        for count in [None, Some(0), Some(1), Some(u32::MAX)] {
+            let source = message_with_key(None, None);
+            let message =
+                Message::<()>::new(&source.topic, source.message_id, source.payload, count);
+            assert_eq!(message.redelivery_count(), count);
+        }
     }
 
     #[test]
